@@ -22,7 +22,7 @@ struct State {
 }
 
 struct Watchers {
-    load_state: Watcher<u8>,
+    load_state: Watcher<u32>,
 }
 
 struct ProcessInfo {
@@ -80,11 +80,7 @@ impl State {
         // Splitting logic
         match timer::state() {
             TimerState::Running => {
-                if load_state.current == 0 {
-                    timer::pause_game_time()
-                } else {
-                    timer::resume_game_time()
-                }
+                if load_state.current == 0 { timer::pause_game_time() } else { timer::resume_game_time() }
             }
             _ => {}
         }
