@@ -1,111 +1,159 @@
 #![no_std]
-use asr::{signature::Signature, timer, timer::TimerState, watcher::Watcher, Address, Process};
+#![feature(type_alias_impl_trait, const_async_blocks)]
+#![warn(
+    clippy::complexity,
+    clippy::correctness,
+    clippy::perf,
+    clippy::style,
+    clippy::undocumented_unsafe_blocks,
+    rust_2018_idioms
+)]
 
-#[cfg(all(not(test), target_arch = "wasm32"))]
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
-}
+use asr::{
+    file_format::pe,
+    future::{next_tick, retry},
+    signature::Signature,
+    time::Duration,
+    timer::{self, TimerState},
+    watcher::Watcher,
+    Address, Process,
+};
 
-static AUTOSPLITTER: spinning_top::Spinlock<State> = spinning_top::const_spinlock(State {
-    game: None,
-    sigscans: None,
-    watchers: Watchers {
-        load_state: Watcher::new(),
-    },
-});
+asr::panic_handler!();
+asr::async_main!(nightly);
 
-struct State {
-    game: Option<ProcessInfo>,
-    sigscans: Option<SigScan>,
-    watchers: Watchers,
-}
+const PROCESS_NAMES: &[&str] = &["PostMouse-Win64-Shipping.exe"];
 
-struct Watchers {
-    load_state: Watcher<u32>,
-}
+async fn main() {
+    //let settings = Settings::register();
 
-struct ProcessInfo {
-    game: Process,
-    main_module_base: Address,
-    //main_module_size: u64,
-}
+    loop {
+        // Hook to the target process
+        let process = retry(|| PROCESS_NAMES.iter().find_map(|&name| Process::attach(name))).await;
 
-impl State {
-    fn attach_process() -> Option<ProcessInfo> {
-        const PROCESS_NAMES: [&str; 1] = ["PostMouse-Win64-Shipping.exe"];
-        let mut proc: Option<Process> = None;
-        let mut procname: &str = "";
+        process
+            .until_closes(async {
+                // Once the target has been found and attached to, set up some default watchers
+                let mut watchers = Watchers::default();
 
-        for name in PROCESS_NAMES {
-            proc = Process::attach(name);
-            if proc.is_some() {
-                procname = name;
-                break;
-            }
-        }
+                // Perform memory scanning to look for the addresses we need
+                let addresses = Addresses::init(&process).await;
 
-        let game = proc?;
-        let main_module_base = game.get_module_address(procname).ok()?;
+                loop {
+                    //settings.update();
 
-        Some(ProcessInfo {
-            game,
-            main_module_base,
-            //main_module_size: game.get_module_size(curgamename).ok()?, // currently broken in livesplit classic
-        })
+                    // Splitting logic. Adapted from OG LiveSplit:
+                    // Order of execution
+                    // 1. update() will always be run first. There are no conditions on the execution of this action.
+                    // 2. If the timer is currently either running or paused, then the isLoading, gameTime, and reset actions will be run.
+                    // 3. If reset does not return true, then the split action will be run.
+                    // 4. If the timer is currently not running (and not paused), then the start action will be run.
+                    update_loop(&process, &addresses, &mut watchers);
+
+                    let timer_state = timer::state();
+                    if timer_state == TimerState::Running || timer_state == TimerState::Paused {
+                        if let Some(is_loading) = is_loading(&watchers) {
+                            match is_loading {
+                                true => timer::pause_game_time(),
+                                false => timer::resume_game_time(),
+                            };
+                        }
+
+                        if let Some(game_time) = game_time(&watchers) {
+                            timer::set_game_time(game_time)
+                        }
+
+                        match reset(&watchers) {
+                            true => timer::reset(),
+                            false => {
+                                if split(&watchers) {
+                                    timer::split()
+                                }
+                            }
+                        };
+                    }
+
+                    if timer::state() == TimerState::NotRunning && start(&watchers) {
+                        timer::start();
+                        timer::pause_game_time();
+
+                        if let Some(is_loading) = is_loading(&watchers) {
+                            match is_loading {
+                                true => timer::pause_game_time(),
+                                false => timer::resume_game_time(),
+                            };
+                        }
+                    }
+
+                    next_tick().await;
+                }
+            })
+            .await;
     }
+}
 
-    fn update(&mut self) {
-        // Checks is LiveSplit is currently attached to a target process and runs attach_process() otherwise
-        if self.game.is_none() {
-            self.game = State::attach_process()
-        }
-        let Some(game) = &self.game else { return };
-        let proc = &game.game;
+#[derive(Default)]
+struct Watchers {
+    load_state: Watcher<bool>,
+}
 
-        if !proc.is_open() {
-            self.game = None;
-            if timer::state() == TimerState::Running { timer::pause_game_time() } // If the game crashes, game time should be paused
-            return;
+struct Addresses {
+    g_world: Address,
+}
+
+impl Addresses {
+    async fn init(process: &Process) -> Self {
+        let main_module = {
+            let main_module_base = retry(|| {
+                PROCESS_NAMES
+                    .iter()
+                    .find_map(|&name| process.get_module_address(name).ok())
+            })
+            .await;
+            let main_module_size =
+                retry(|| pe::read_size_of_image(process, main_module_base)).await as u64;
+
+            (main_module_base, main_module_size)
         };
 
-        // Update
-        // Look for valid sigscans and performs sigscan if necessary
-        let Some(addresses) = &self.sigscans else { self.sigscans = SigScan::new(proc, game.main_module_base); return; };
+        let ptr = {
+            const SIG: Signature<15> =
+                Signature::new("80 7C 24 ?? 00 ?? ?? 48 8B 3D ?? ?? ?? ?? 48");
+            let ptr = retry(|| SIG.scan_process_range(process, main_module)).await + 0xA;
+            ptr + 0x4 + retry(|| process.read::<i32>(ptr)).await
+        };
 
-        // Update the watchers variables
-        let Some(load_state) = self.watchers.load_state.update(proc.read_pointer_path64(addresses.gworld.0, &[0x0, 0x180, 0x38, 0x0, 0x30, 0x250, 0x350]).ok()) else { return };
-
-
-        // Splitting logic
-        match timer::state() {
-            TimerState::Running => {
-                if load_state.current == 0 { timer::pause_game_time() } else { timer::resume_game_time() }
-            }
-            _ => {}
-        }
+        Self { g_world: ptr }
     }
 }
 
-#[no_mangle]
-pub extern "C" fn update() {
-    AUTOSPLITTER.lock().update();
+fn update_loop(game: &Process, addresses: &Addresses, watchers: &mut Watchers) {
+    watchers.load_state.update_infallible(
+        game.read_pointer_path64::<u32>(
+            addresses.g_world,
+            &[0x0, 0x180, 0x38, 0x0, 0x30, 0x250, 0x350],
+        )
+        .unwrap_or_default()
+            == 0,
+    );
 }
 
-struct SigScan {
-    gworld: Address,
+fn start(_watchers: &Watchers) -> bool {
+    false
 }
 
-impl SigScan {
-    fn new(process: &Process, addr: Address) -> Option<Self> {
-        let size = 0x4A57000; // Hack, until we can actually query ModuleMemorySize
- 
-        const SIG: Signature<15> = Signature::new("80 7C 24 ?? 00 ?? ?? 48 8B 3D ???????? 48");
-        let mut ptr = SIG.scan_process_range(process, addr, size)?.0 + 0xA;
-        ptr += 0x4 + process.read::<u32>(Address(ptr)).ok()? as u64;
+fn split(_watchers: &Watchers) -> bool {
+    false
+}
 
-        Some(Self {
-            gworld: Address(ptr),
-        })
-    }
+fn reset(_watchers: &Watchers) -> bool {
+    false
+}
+
+fn is_loading(watchers: &Watchers) -> Option<bool> {
+    Some(watchers.load_state.pair?.current)
+}
+
+fn game_time(_watchers: &Watchers) -> Option<Duration> {
+    None
 }
